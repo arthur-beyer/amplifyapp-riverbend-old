@@ -1,0 +1,10 @@
+type Customer @model @auth(rules: [{allow: public}]) {
+  authorize_net_profile_id: ID! @primaryKey
+  authorize_net_payment_profile_id: ID!
+  freshsuite_account_id: ID!
+  company_name: String!
+  email: AWSEmail!
+  rate: Int!
+  fname: String
+  lname: String
+}
