@@ -10,42 +10,7 @@ import { Auth } from 'aws-amplify';
 
 export const BillCustomersPage = ({ signOut }) => {
 	const navigate = useNavigate();
-	const TEST = true;
-	let AUTHORIZE_API_KEY, AUTHORIZE_TRANSACTION_KEY, AUTHORIZE_URL;
-
-	if (TEST) {
-	  // SANDBOX KEYS
-	  AUTHORIZE_API_KEY = "52SQnv5H67P";
-	  AUTHORIZE_TRANSACTION_KEY = "9eb46AnVF6E573nk";
-	  AUTHORIZE_URL = 'https://apitest.authorize.net/xml/v1/request.api';
-	} else {
-	  // PRODUCTION KEYS GENERATED JAN 26 2023 08:51:00
-	  AUTHORIZE_API_KEY = "4356qj7XWZ";
-	  AUTHORIZE_TRANSACTION_KEY = "4uW7a7sm77UTn3d4";
-	  AUTHORIZE_URL = 'https://api.authorize.net/xml/v1/request.api';
-	}
-
-	async function lambda_handler(event, context) {
-	  let anet_pid_to_amount, failed_input, anet_pids;
-	  [anet_pid_to_amount, failed_input, anet_pids] = handle_input(event);
-
-	  let customers_to_charge, failed_dynamo;
-	  [customers_to_charge, failed_dynamo] = await poll_dynamodb_table(anet_pid_to_amount);
-
-	  const sorted_customers_to_charge = sort_customers_to_charge(customers_to_charge, anet_pids, failed_dynamo);
-
-	  let successes, failed_anet;
-	  [successes, failed_anet] = await charge_customers(sorted_customers_to_charge);
-
-	  const failures = [...failed_input, ...failed_dynamo, ...failed_anet];
-
-	  const output = combine_successes_failures(successes, failures, anet_pids);
-	  const ret = {
-	    'output': output
-	  };
-
-		return "{ 'statusCode': 200, 'body': json.dumps(ret) };" // TODO
-	}
+	const BILL_CUSTOMERS_API_ENDPOINT = "https://zuzh8sz21i.execute-api.us-east-2.amazonaws.com/stage1"
 
 	async function poll_dynamodb_table(anet_pid_to_amount) {
 		console.log("POLLING DYNAMODB")
@@ -54,15 +19,6 @@ export const BillCustomersPage = ({ signOut }) => {
 		    or: Object.keys(anet_pid_to_amount).map((anet_pid) => ({ authorize_net_profile_id: { eq: parseInt(anet_pid) }}))
 		  }
 		}
-
-		// const variables = {
-		// 	filter: {
-		//     or: [
-		// 			{ authorize_net_profile_id: { eq: parseInt('1234') }},
-		// 			{ authorize_net_profile_id: { eq: parseInt('3456') }},
-		// 		]
-		//   }
-		// }
 
 		console.log("QUERY: ", variables)
 		try {
@@ -88,56 +44,41 @@ export const BillCustomersPage = ({ signOut }) => {
 			return [customers_to_charge, Object.keys(anet_pid_to_amount)];
 		} catch (error) {
 			console.log("DynamoDB error: ", error)
+			alert("DynamoDB error")
 			return [[], []];
 		}
 	}
 
 	async function charge_customers(customers_to_charge) {
-	  const successes = [];
-	  const failures = [];
-
-	  for (const customer of customers_to_charge) {
-	    const data = {
-	      "createTransactionRequest": {
-	        "merchantAuthentication": {
-	          "name": AUTHORIZE_API_KEY,
-	          "transactionKey": AUTHORIZE_TRANSACTION_KEY
-	        },
-	        "transactionRequest": {
-	          "transactionType": "authCaptureTransaction",
-	          "amount": customer['amount'],
-	          "profile": {
-	            "customerProfileId": customer['anet_pid'],
-	            "paymentProfile": { "paymentProfileId": customer['anet_ppid'] }
-	          },
-	        }
-	      }
-	    };
-
-	    try {
-	      const response = await axios.post(AUTHORIZE_URL, data);
-				console.log("ANET RESPONSE: ", response)
-
-	      const text = response.data.lstrip('\ufeff');
-	      const responseData = 'json.loads(text);' //TODO
-	      console.log('ANET response: ', responseData);
-
-	      if (responseData !== null && 'messages' in responseData) {
-	        if ('resultCode' in responseData['messages'] && responseData['messages']['resultCode'] === "Ok") {
-	          successes.push([customer['anet_pid'], responseData['transactionResponse']['transId']]);
-	        } else {
-	          failures.push([customer['anet_pid'], "Anet " + responseData['messages']['message'][0]['text']]);
-	        }
-	      } else {
-	        failures.push([customer['anet_pid'], "Anet Unknown Error"]);
-	      }
-	    } catch (error) {
-	      console.error('Error charging customer:', error);
-	      failures.push([customer['anet_pid'], "Anet Unknown Error"]);
-	    }
-	  }
-
-	  return [successes, failures];
+		console.log("customers: ", customers_to_charge)
+		try {
+			const session = await Auth.currentSession();
+			let idToken = session.idToken.jwtToken
+	
+			const header = {
+				headers: {
+					Authorization: `Bearer ${idToken}`
+				}
+			}
+			const requestBody = {
+				data: customers_to_charge
+			}
+			console.log('Request Body: ', requestBody)
+			const response = await axios.post(BILL_CUSTOMERS_API_ENDPOINT, requestBody, header)
+			console.log('Response: ', response)
+	
+			var data = response.data;
+			console.log('data: ', data)
+			if (data.statusCode == 200) {
+				var body = JSON.parse(data.body);
+				return [body.successes, body.failures]
+			} else {
+				console.log("API Gateway error")
+			}
+		} catch (error) {
+			console.log(error)
+		}
+		return [[], []]
 	}
 
 	function handle_input(input) {
@@ -180,50 +121,25 @@ export const BillCustomersPage = ({ signOut }) => {
 		return [anet_pid_to_amount, failed_input, anet_pids];
 	}
 
-	function sort_customers_to_charge(customers_to_charge, anet_pids, failed_dynamo) {
-	  const failed_dynamo_set = new Set(failed_dynamo);
-	  const remaining_anet_pids = anet_pids.filter(anet_pid => !failed_dynamo_set.has(anet_pid));
-
-		const anet_pid_to_idx = {};
-		for (let i = 0; i < remaining_anet_pids.length; i++) {
-		  const anet_pid = remaining_anet_pids[i];
-		  anet_pid_to_idx[anet_pid] = i;
+	function sort_successes_failures(successes, failures, all_keys) {
+		// Create a map for successes and failures to quickly look up messages by key
+		const successesMap = new Map(successes);
+		const failuresMap = new Map(failures);
+	
+		// Initialize an empty array to store the interleaved result
+		const interleavedResult = [];
+	
+		// Loop through all_keys and add messages from successes or failures to interleavedResult based on their existence in the corresponding maps
+		for (const key of all_keys) {
+			if (successesMap.has(key)) {
+				interleavedResult.push([key, successesMap.get(key)]);
+			} else if (failuresMap.has(key)) {
+				interleavedResult.push([key, failuresMap.get(key)]);
+			}
 		}
-
-	  const output = new Array(remaining_anet_pids.length);
-	  customers_to_charge.forEach(customer => {
-      const idx = anet_pid_to_idx[customer['anet_pid']];
-      output[idx] = customer;
-	  });
-
-	  return output;
-	}
-
-	function combine_successes_failures(successes, failures, anet_pids) {
-	  let i = 0;
-	  let j = 0;
-	  const ret = [];
-	  for (const anet_pid of anet_pids) {
-	    if (i === successes.length || j === failures.length) {
-	      break;
-	    }
-
-	    if (anet_pid === successes[i][0]) {
-	      ret.push(successes[i]);
-	      i++;
-	    } else {
-	      ret.push(failures[j]);
-	      j++;
-	    }
-	  }
-
-	  if (i === successes.length) {
-	    ret.push(...failures.slice(j));
-	  } else {
-	    ret.push(...successes.slice(i));
-	  }
-
-	  return ret;
+	
+		// Return the interleaved result
+		return interleavedResult;
 	}
 
 	async function bill_customers() {
@@ -235,18 +151,20 @@ export const BillCustomersPage = ({ signOut }) => {
 
 	  let customers_to_charge, failed_dynamo;
 	  [customers_to_charge, failed_dynamo] = await poll_dynamodb_table(anet_pid_to_amount);
-
-		const sorted_customers_to_charge = sort_customers_to_charge(customers_to_charge, anet_pids, failed_dynamo);
+		for (var i = 0; i < failed_dynamo.length; i++) {
+			failed_dynamo[i] = [failed_dynamo[i], "Profile ID not found in database"]
+		}
 
 	  let successes, failed_anet;
-		console.log("SORTED ", sorted_customers_to_charge)
-	  [successes, failed_anet] = await charge_customers(sorted_customers_to_charge);
+	  [successes, failed_anet] = await charge_customers(customers_to_charge);
 
-		try {
-			let x = 0
-		} catch (e) {
-			let y = 0
-		}
+		const failures = [...failed_input, ...failed_dynamo, ...failed_anet];
+		console.log("Failed ", failures)
+
+	  const output_sorted = sort_successes_failures(successes, failures, anet_pids);
+		console.log("OUTPUT SORTED", output_sorted)
+
+		document.getElementById('output_data').value = output_sorted.map(inner_lst => inner_lst[1]).join("\n");
 	}
 
 	return (
@@ -256,6 +174,9 @@ export const BillCustomersPage = ({ signOut }) => {
 			<View margin="3rem 0">
 				<TextAreaField label="Input Data" id="input_data"/>
 				<Button onClick={bill_customers}>Bill Customer</Button>
+			</View>
+			<View margin="3rem 0">
+				<TextAreaField label="Output" id="output_data"/>
 			</View>
 			<Button onClick={signOut}>Sign Out</Button>
 			<Button onClick={() => navigate("/update_customers")}>Navigate</Button>
